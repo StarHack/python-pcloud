@@ -22,6 +22,13 @@ from pcloud.validate import RequiredParameterCheck
 from urllib.parse import urlparse
 from urllib.parse import urlunsplit
 
+try:
+    from pcloud.crypto import decrypt_private_key, KeyPair
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    KeyPair = None
+
 
 ONLY_PCLOUD_MSG = "This method can't be used from web applications. Referrer is restricted to pcloud.com."
 
@@ -50,7 +57,7 @@ class PyCloud(object):
     }
 
     def __init__(
-        self, username, password, endpoint="api", token_expire=31536000, oauth2=False
+        self, username, password, endpoint="api", token_expire=31536000, oauth2=False, crypto_password=None
     ):
         if endpoint not in self.endpoints:
             log.error(
@@ -70,6 +77,9 @@ class PyCloud(object):
         self.username = username.lower().encode("utf-8")
         self.password = password.encode("utf-8")
         self.token_expire = token_expire
+        self.crypto_password = crypto_password
+        self.keypair = None
+        
         if oauth2:
             log.info("Using oauth2 authentication method.")
             self.access_token = password
@@ -84,6 +94,16 @@ class PyCloud(object):
             log.info("Using username/password authentication method.")
             self.access_token = ""
             self.auth_token = self.get_auth_token()
+        
+        # Initialize crypto keys if crypto_password is provided
+        if self.crypto_password:
+            if not CRYPTO_AVAILABLE:
+                log.error("Crypto password provided but pycryptodome is not installed. Install with: pip install pycryptodome")
+            else:
+                try:
+                    self._init_crypto_keys()
+                except Exception as e:
+                    log.error(f"Failed to initialize crypto keys: {e}")
 
     @classmethod
     def oauth2_authorize(
@@ -113,6 +133,28 @@ class PyCloud(object):
         return self.connection.do_get_request(
             method, authenticate, json, endpoint, **kw
         )
+    
+    def _init_crypto_keys(self):
+        """Initialize crypto keys by fetching user keys from pCloud."""
+        if not self.crypto_password:
+            return
+        
+        log.info("Fetching crypto user keys...")
+        resp = self._do_request("crypto_getuserkeys")
+        
+        if "privatekey" not in resp or "publickey" not in resp:
+            raise ValueError("Failed to fetch crypto user keys")
+        
+        private_key = resp["privatekey"]
+        public_key = resp["publickey"]
+        
+        log.info("Decrypting private key...")
+        self.keypair = decrypt_private_key(
+            self.crypto_password,
+            private_key,
+            public_key
+        )
+        log.info("Crypto keys initialized successfully.")
 
     # Authentication
     def getdigest(self):
@@ -190,7 +232,61 @@ class PyCloud(object):
 
     @RequiredParameterCheck(("path", "folderid"))
     def listfolder(self, **kwargs):
-        return self._do_request("listfolder", **kwargs)
+        result = self._do_request("listfolder", **kwargs)
+        
+        # Check if folder is encrypted and decrypt filenames if needed
+        if self.keypair and result.get("metadata", {}).get("encrypted"):
+            try:
+                self._decrypt_folder_contents(result["metadata"])
+            except Exception as e:
+                log.warning(f"Failed to decrypt folder contents: {e}")
+        
+        return result
+    
+    def _decrypt_folder_contents(self, metadata):
+        """Recursively decrypt filenames in folder metadata."""
+        if not CRYPTO_AVAILABLE or not self.keypair:
+            return
+        
+        # Get the folder ID
+        folderid = metadata.get("folderid")
+        if not folderid:
+            log.warning("Cannot decrypt folder: no folderid found")
+            return
+        
+        # Fetch the encrypted folder key from pCloud
+        try:
+            key_response = self._do_request("crypto_getfolderkey", folderid=folderid)
+            encrypted_key = key_response.get("key")
+            if not encrypted_key:
+                log.warning(f"No encryption key returned for folder {folderid}")
+                return
+        except Exception as e:
+            log.warning(f"Failed to fetch folder key for folder {folderid}: {e}")
+            return
+        
+        # Decrypt the folder key
+        try:
+            from pcloud.crypto import decrypt_filename
+            folder_key = self.keypair.decrypt_folder_key(encrypted_key)
+        except Exception as e:
+            log.warning(f"Failed to decrypt folder key: {e}")
+            return
+        
+        # Decrypt file and folder names in contents
+        contents = metadata.get("contents", [])
+        for item in contents:
+            if item.get("encrypted"):
+                encrypted_name = item.get("name", "")
+                try:
+                    decrypted_name = decrypt_filename(encrypted_name, folder_key)
+                    item["name"] = decrypted_name
+                except Exception as e:
+                    log.warning(f"Failed to decrypt filename '{encrypted_name}': {e}")
+            
+            # Recursively decrypt subfolders
+            if item.get("isfolder") and item.get("encrypted"):
+                self._decrypt_folder_contents(item)
 
     @RequiredParameterCheck(("path", "folderid"))
     def renamefolder(self, **kwargs):
