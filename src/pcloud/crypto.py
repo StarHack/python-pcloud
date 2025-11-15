@@ -1,5 +1,5 @@
 """
-pCloud crypto support for encrypted filenames and folder keys.
+pCloud crypto support for encrypted filenames, folder keys, and file decryption.
 Translated from pCloud's Go crypto implementation.
 """
 
@@ -7,6 +7,7 @@ import base64
 import hmac
 import struct
 import hashlib
+import logging
 from hashlib import sha1, sha512
 from typing import Tuple, Optional
 
@@ -14,6 +15,23 @@ from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.Hash import SHA1, SHA512
 from Crypto.Protocol.KDF import PBKDF2
 from Crypto.PublicKey import RSA
+
+logger = logging.getLogger(__name__)
+
+# Constants for sector-based file decryption
+SECTOR_SIZE = 4096
+AUTH_SIZE = 32
+TREE_SECTORS = 128
+
+MAX_LEVEL_SIZE = [
+    4096,
+    528384,
+    67637248,
+    8657571840,
+    1108169199616,
+    0x810204081000,
+    0x40810204081000,
+]
 
 
 class FolderKey:
@@ -78,6 +96,12 @@ class KeyPair:
         hmac_key = dec[40:]
         
         return FolderKey(type_, flags, aes_key, hmac_key)
+
+    def decrypt_file_key(self, encrypted_key: str) -> FolderKey:
+        """Decrypt a file's Content Encryption Key (CEK) using RSA-OAEP (SHA-1).
+        The format matches decrypt_folder_key (type|flags|AES|HMAC).
+        """
+        return self.decrypt_folder_key(encrypted_key)
 
 
 # Helper functions
@@ -321,3 +345,597 @@ def decrypt_private_key(
         raise ValueError(f"Failed to parse public key: {e}")
     
     return KeyPair(priv_key, pub_key, rsa_priv, rsa_pub)
+
+
+# File decryption functions
+
+class CipherOffsetsInfo:
+    """Offsets structure for sector-based file decryption."""
+    
+    def __init__(self):
+        self.need_master_auth = False
+        self.master_auth_offset = 0
+        self.plain_size = 0
+        self.sectors = 0
+        self.cipher_size = 0
+        self.tree_levels = 0
+        self.last_auth_offset = []
+        self.last_auth_length = []
+    
+    def ensure_levels(self, levels: int):
+        """Ensure arrays have enough capacity for tree levels."""
+        if len(self.last_auth_offset) < levels:
+            self.last_auth_offset.extend([0] * (levels - len(self.last_auth_offset)))
+        if len(self.last_auth_length) < levels:
+            self.last_auth_length.extend([0] * (levels - len(self.last_auth_length)))
+
+
+def compute_cipher_offsets(cipher_size: int) -> CipherOffsetsInfo:
+    """Compute offsets for encrypted file structure."""
+    n = CipherOffsetsInfo()
+    
+    if cipher_size <= AUTH_SIZE:
+        return n
+    
+    n.cipher_size = cipher_size
+    n.need_master_auth = cipher_size > SECTOR_SIZE + AUTH_SIZE
+    t = cipher_size - AUTH_SIZE
+    
+    if n.need_master_auth:
+        n.master_auth_offset = t
+    else:
+        n.master_auth_offset = t + AUTH_SIZE
+    
+    # Determine tree level
+    i = 0
+    while i < len(MAX_LEVEL_SIZE) and not (t <= MAX_LEVEL_SIZE[i]):
+        i += 1
+    
+    e = t
+    n.tree_levels = i
+    n.ensure_levels(i + 1)
+    n.last_auth_offset[i] = e
+    n.last_auth_length[i] = AUTH_SIZE
+    
+    while i > 0:
+        i -= 1
+        r = (t + MAX_LEVEL_SIZE[i] + AUTH_SIZE - 1) // (MAX_LEVEL_SIZE[i] + AUTH_SIZE)
+        t -= r * AUTH_SIZE
+        r %= TREE_SECTORS
+        if r == 0:
+            r = TREE_SECTORS
+        e -= r * AUTH_SIZE
+        n.last_auth_offset[i] = e
+        n.last_auth_length[i] = r * AUTH_SIZE
+    
+    n.plain_size = t
+    n.sectors = (t + SECTOR_SIZE - 1) // SECTOR_SIZE
+    return n
+
+
+def level_auth_offset(level: int, e: int) -> int:
+    """Calculate auth offset for a given level."""
+    r = MAX_LEVEL_SIZE[level + 1] * (e + 1) - SECTOR_SIZE
+    while e >= TREE_SECTORS:
+        e = e // TREE_SECTORS
+        r += e * SECTOR_SIZE
+    return r
+
+
+def data_cipher_offset_by_sectorid(t: int) -> int:
+    """Calculate data offset for a sector ID."""
+    e = t * SECTOR_SIZE
+    while t >= TREE_SECTORS:
+        t = t // TREE_SECTORS
+        e += t * SECTOR_SIZE
+    return e
+
+
+def cipher_download_offset(t: int, n: CipherOffsetsInfo) -> tuple:
+    """Get download offset range for a sector."""
+    r = data_cipher_offset_by_sectorid(t)
+    i = data_cipher_offset_by_sectorid(t + TREE_SECTORS)
+    if t + TREE_SECTORS > n.sectors:
+        i = n.cipher_size
+    return (r, i, i - r)
+
+
+def get_last_sectorid_by_size(t: int) -> int:
+    """Get last sector ID for a given size."""
+    if t == 0:
+        return 0
+    return (t - 1) // SECTOR_SIZE
+
+
+def auth_sector_offset(t: int, level: int, n: CipherOffsetsInfo) -> tuple:
+    """Get auth window for a sector at a given level."""
+    i = get_last_sectorid_by_size(n.plain_size) // TREE_SECTORS
+    nn = t // TREE_SECTORS
+    s = t % TREE_SECTORS
+    
+    for o in range(level):
+        i = i // TREE_SECTORS
+        s = nn % TREE_SECTORS
+        nn = nn // TREE_SECTORS
+    
+    if nn == i:
+        n.ensure_levels(level + 1)
+        a = n.last_auth_offset[level]
+        f = n.last_auth_length[level]
+    else:
+        a = level_auth_offset(level, nn)
+        f = SECTOR_SIZE
+    
+    return (a, f, s)
+
+
+def xor_bytes_limit(a: bytes, b: bytes, n: int) -> bytes:
+    """XOR two byte arrays up to n bytes."""
+    if len(a) < n or len(b) < n:
+        n = min(len(a), len(b))
+    return bytes(a[i] ^ b[i] for i in range(n))
+
+
+def xor_exact(a: bytes, b: bytes) -> bytes:
+    """XOR two byte arrays of equal length."""
+    if len(a) != len(b):
+        raise ValueError("xorBytes length mismatch")
+    return bytes(a[i] ^ b[i] for i in range(len(a)))
+
+
+def decrypt_sector(key: FolderKey, cipher_data: bytes, auth: bytes, sector_id: int) -> bytes:
+    """Decrypt a single sector using pCloud's sector encryption.
+    
+    Exactly matches the Go implementation from pcrypto.js decryptSector.
+    """
+    if len(auth) != 32:
+        raise ValueError(f"auth length {len(auth)} != 32")
+    
+    # n = AES-ECB-DEC(auth, AESKey) - decrypt 32 bytes as two blocks
+    blk = AES.new(key.aes_key, AES.MODE_ECB)
+    n = bytearray(32)
+    n[0:16] = blk.decrypt(auth[0:16])
+    n[16:32] = blk.decrypt(auth[16:32])
+    
+    # o = n[0:8] || n[24:32] (16 bytes total)
+    # f = n[8:24] (16 bytes - the IV/HMAC check value)
+    o = bytearray(n[0:8])
+    o.extend(n[24:32])
+    f = bytes(n[8:24])
+    
+    e = cipher_data
+    p = bytearray()
+    
+    if len(e) < 16:
+        # Short data: XOR with o
+        p = bytearray(xor_bytes_limit(o, e, len(e)))
+        # Update o for HMAC: o = e || o[len(e):]
+        o_orig = bytes(o)
+        o = bytearray(e)
+        o.extend(o_orig[len(e):])
+    else:
+        # Process full/partial blocks
+        u = 0
+        tail = None
+        
+        if len(e) % 16 != 0:
+            # Has unaligned tail
+            u = len(e) % 16
+            l = len(e) - 16 - u
+            tail = e[l:]
+            e = e[:l]
+        
+        if len(e) > 0:
+            # CBC decrypt main blocks with IV=f
+            cbc = AES.new(key.aes_key, AES.MODE_CBC, f)
+            pt = cbc.decrypt(e)
+            p.extend(pt)
+        
+        if tail is not None:
+            # Handle unaligned tail (ciphertext stealing)
+            # v = last ciphertext block or f if no blocks
+            if len(e) > 0:
+                v = e[-16:]
+            else:
+                v = f
+            
+            # Decrypt first 16 bytes of tail
+            b = bytearray(blk.decrypt(tail[:16]))
+            # XOR with remaining tail bytes
+            y = xor_exact(bytes(b[:u]), tail[16:])
+            # Construct block: tail[16:] || b[u:]
+            g = bytearray(tail[16:])
+            g.extend(b[u:])
+            # Decrypt with CBC using v as IV
+            cbc2 = AES.new(key.aes_key, AES.MODE_CBC, v)
+            dec = cbc2.decrypt(bytes(g))
+            p.extend(dec)
+            p.extend(y)
+    
+    # Verify HMAC: w = m || uint64(sectorID LE) || o
+    sid = bytearray(8)
+    tmp = sector_id
+    for i in range(8):
+        sid[i] = tmp % 256
+        tmp //= 256
+    
+    w = bytes(p) + bytes(sid) + bytes(o)
+    mac = hmac.new(key.hmac_key, w, sha512)
+    sum_bytes = mac.digest()
+    
+    if not hmac.compare_digest(sum_bytes[:16], f):
+        raise ValueError("sector auth compare fail")
+    
+    return bytes(p)
+
+
+def decrypt_file_contents(encrypted_data: bytes, file_key: FolderKey) -> bytes:
+    """Decrypt encrypted file data using sector-based decryption."""
+    offs = compute_cipher_offsets(len(encrypted_data))
+    
+    if offs.plain_size < 0 or offs.sectors < 0:
+        raise ValueError(f"invalid offsets for size={len(encrypted_data)}")
+    
+    out = bytearray()
+    sector = 0
+    
+    while sector < offs.sectors:
+        # Determine chunk covering up to TREE_SECTORS sectors
+        chunk_offset, chunk_end, _ = cipher_download_offset(sector, offs)
+        
+        if chunk_offset < 0 or chunk_end > len(encrypted_data) or chunk_offset >= chunk_end:
+            raise ValueError(f"invalid chunk offsets at sector {sector}")
+        
+        # Level-0 auth position
+        a0_offset, a0_length, a0_authID = auth_sector_offset(sector, 0, offs)
+        
+        # Number of sectors available from this auth window
+        d = a0_length // AUTH_SIZE - a0_authID
+        if d <= 0:
+            raise ValueError(f"bad auth window d={d} at sector={sector}")
+        
+        # Data length for this chunk up to first level-0 auth
+        p = a0_offset - chunk_offset
+        
+        # Process up to d sectors in this chunk
+        for y in range(d):
+            if sector + y >= offs.sectors:
+                break
+            
+            # Compute sector length
+            f = SECTOR_SIZE
+            if not (a0_offset == SECTOR_SIZE * TREE_SECTORS or y != d - 1):
+                f = p - y * SECTOR_SIZE
+                if f < 0:
+                    raise ValueError(f"negative sector length at sector={sector + y}")
+            
+            data_start = chunk_offset + y * SECTOR_SIZE
+            data_end = data_start + f
+            
+            if data_start < 0 or data_end > len(encrypted_data):
+                raise ValueError(f"data slice OOB sector={sector + y}")
+            
+            c = encrypted_data[data_start:data_end]
+            
+            # Auth record for this sector at level 0
+            auth_start = a0_offset + (a0_authID + y) * AUTH_SIZE
+            auth_end = auth_start + AUTH_SIZE
+            
+            if auth_end > len(encrypted_data):
+                raise ValueError(f"auth slice OOB sector={sector + y}")
+            
+            h = encrypted_data[auth_start:auth_end]
+            
+            pt = decrypt_sector(file_key, c, h, sector + y)
+            out.extend(pt)
+        
+        sector += TREE_SECTORS
+    
+    # Truncate to exact plain size
+    if len(out) > offs.plain_size:
+        out = out[:offs.plain_size]
+    
+    return bytes(out)
+
+
+# File decryption functions
+
+class CipherOffsetsInfo:
+    """Offsets structure for sector-based file decryption."""
+    
+    def __init__(self):
+        self.need_master_auth = False
+        self.master_auth_offset = 0
+        self.plain_size = 0
+        self.sectors = 0
+        self.cipher_size = 0
+        self.tree_levels = 0
+        self.last_auth_offset = []
+        self.last_auth_length = []
+    
+    def ensure_levels(self, levels: int):
+        """Ensure arrays have enough capacity for tree levels."""
+        if len(self.last_auth_offset) < levels:
+            self.last_auth_offset.extend([0] * (levels - len(self.last_auth_offset)))
+        if len(self.last_auth_length) < levels:
+            self.last_auth_length.extend([0] * (levels - len(self.last_auth_length)))
+
+
+def compute_cipher_offsets(cipher_size: int) -> CipherOffsetsInfo:
+    """Compute offsets for encrypted file structure."""
+    n = CipherOffsetsInfo()
+    
+    if cipher_size <= AUTH_SIZE:
+        return n
+    
+    n.cipher_size = cipher_size
+    n.need_master_auth = cipher_size > SECTOR_SIZE + AUTH_SIZE
+    t = cipher_size - AUTH_SIZE
+    
+    if n.need_master_auth:
+        n.master_auth_offset = t
+    else:
+        n.master_auth_offset = t + AUTH_SIZE
+    
+    # Determine tree level
+    i = 0
+    while i < len(MAX_LEVEL_SIZE) and not (t <= MAX_LEVEL_SIZE[i]):
+        i += 1
+    
+    e = t
+    n.tree_levels = i
+    n.ensure_levels(i + 1)
+    n.last_auth_offset[i] = e
+    n.last_auth_length[i] = AUTH_SIZE
+    
+    while i > 0:
+        i -= 1
+        r = (t + MAX_LEVEL_SIZE[i] + AUTH_SIZE - 1) // (MAX_LEVEL_SIZE[i] + AUTH_SIZE)
+        t -= r * AUTH_SIZE
+        r %= TREE_SECTORS
+        if r == 0:
+            r = TREE_SECTORS
+        e -= r * AUTH_SIZE
+        n.last_auth_offset[i] = e
+        n.last_auth_length[i] = r * AUTH_SIZE
+    
+    n.plain_size = t
+    n.sectors = (t + SECTOR_SIZE - 1) // SECTOR_SIZE
+    return n
+
+
+def level_auth_offset(level: int, e: int) -> int:
+    """Calculate auth offset for a given level."""
+    r = MAX_LEVEL_SIZE[level + 1] * (e + 1) - SECTOR_SIZE
+    while e >= TREE_SECTORS:
+        e = e // TREE_SECTORS
+        r += e * SECTOR_SIZE
+    return r
+
+
+def data_cipher_offset_by_sectorid(t: int) -> int:
+    """Calculate data offset for a sector ID."""
+    e = t * SECTOR_SIZE
+    while t >= TREE_SECTORS:
+        t = t // TREE_SECTORS
+        e += t * SECTOR_SIZE
+    return e
+
+
+def cipher_download_offset(t: int, n: CipherOffsetsInfo) -> tuple:
+    """Get download offset range for a sector."""
+    r = data_cipher_offset_by_sectorid(t)
+    i = data_cipher_offset_by_sectorid(t + TREE_SECTORS)
+    if t + TREE_SECTORS > n.sectors:
+        i = n.cipher_size
+    return (r, i, i - r)
+
+
+def get_last_sectorid_by_size(t: int) -> int:
+    """Get last sector ID for a given size."""
+    if t == 0:
+        return 0
+    return (t - 1) // SECTOR_SIZE
+
+
+def auth_sector_offset(t: int, level: int, n: CipherOffsetsInfo) -> tuple:
+    """Get auth window for a sector at a given level."""
+    i = get_last_sectorid_by_size(n.plain_size) // TREE_SECTORS
+    nn = t // TREE_SECTORS
+    s = t % TREE_SECTORS
+    
+    for o in range(level):
+        i = i // TREE_SECTORS
+        s = nn % TREE_SECTORS
+        nn = nn // TREE_SECTORS
+    
+    if nn == i:
+        n.ensure_levels(level + 1)
+        a = n.last_auth_offset[level]
+        f = n.last_auth_length[level]
+    else:
+        a = level_auth_offset(level, nn)
+        f = SECTOR_SIZE
+    
+    return (a, f, s)
+
+
+def xor_bytes_limit(a: bytes, b: bytes, n: int) -> bytes:
+    """XOR two byte arrays up to n bytes."""
+    if len(a) < n or len(b) < n:
+        n = min(len(a), len(b))
+    return bytes(a[i] ^ b[i] for i in range(n))
+
+
+def xor_exact(a: bytes, b: bytes) -> bytes:
+    """XOR two byte arrays of equal length."""
+    if len(a) != len(b):
+        raise ValueError("xorBytes length mismatch")
+    return bytes(a[i] ^ b[i] for i in range(len(a)))
+
+
+def decrypt_sector(key: FolderKey, cipher_data: bytes, auth: bytes, sector_id: int) -> bytes:
+    """Decrypt a single sector using pCloud's sector encryption.
+    
+    Exactly matches the Go implementation from pcrypto.js decryptSector.
+    """
+    if len(auth) != 32:
+        raise ValueError(f"auth length {len(auth)} != 32")
+    
+    logger.info(f"Sector {sector_id}: cipher_data_len={len(cipher_data)}, cipher_preview={cipher_data[:32].hex()}...")
+    
+    # n = AES-ECB-DEC(auth, AESKey) - decrypt 32 bytes as two blocks
+    blk = AES.new(key.aes_key, AES.MODE_ECB)
+    n = bytearray(32)
+    n[0:16] = blk.decrypt(auth[0:16])
+    n[16:32] = blk.decrypt(auth[16:32])
+    
+    logger.info(f"Sector {sector_id}: auth={auth.hex()[:64]}...")
+    logger.info(f"Sector {sector_id}: n={bytes(n).hex()}")
+    
+    # o = n[0:8] || n[24:32] (16 bytes total)
+    # f = n[8:24] (16 bytes - the IV/HMAC check value)
+    o = bytearray(n[0:8])
+    o.extend(n[24:32])
+    f = bytes(n[8:24])
+    
+    logger.info(f"Sector {sector_id}: o={bytes(o).hex()}, f={f.hex()}")
+    
+    e = cipher_data
+    p = bytearray()
+    
+    if len(e) < 16:
+        # Short data: XOR with o
+        p = bytearray(xor_bytes_limit(o, e, len(e)))
+        # Update o for HMAC: o = e || o[len(e):]
+        o_orig = bytes(o)
+        o = bytearray(e)
+        o.extend(o_orig[len(e):])
+    else:
+        # Process full/partial blocks
+        u = 0
+        tail = None
+        
+        if len(e) % 16 != 0:
+            # Has unaligned tail
+            u = len(e) % 16
+            l = len(e) - 16 - u
+            tail = e[l:]
+            e = e[:l]
+        
+        if len(e) > 0:
+            # CBC decrypt main blocks with IV=f
+            cbc = AES.new(key.aes_key, AES.MODE_CBC, f)
+            pt = cbc.decrypt(e)
+            p.extend(pt)
+        
+        if tail is not None:
+            # Handle unaligned tail (ciphertext stealing)
+            # v = last ciphertext block or f if no blocks
+            if len(e) > 0:
+                v = e[-16:]
+            else:
+                v = f
+            
+            # Decrypt first 16 bytes of tail
+            b = bytearray(blk.decrypt(tail[:16]))
+            # XOR with remaining tail bytes
+            y = xor_exact(bytes(b[:u]), tail[16:])
+            # Construct block: tail[16:] || b[u:]
+            g = bytearray(tail[16:])
+            g.extend(b[u:])
+            # Decrypt with CBC using v as IV
+            cbc2 = AES.new(key.aes_key, AES.MODE_CBC, v)
+            dec = cbc2.decrypt(bytes(g))
+            p.extend(dec)
+            p.extend(y)
+    
+    # Verify HMAC: w = m || uint64(sectorID LE) || o
+    sid = bytearray(8)
+    tmp = sector_id
+    for i in range(8):
+        sid[i] = tmp % 256
+        tmp //= 256
+    
+    w = bytes(p) + bytes(sid) + bytes(o)
+    mac = hmac.new(key.hmac_key, w, sha512)
+    sum_bytes = mac.digest()
+    
+    logger.info(f"Sector {sector_id}: plaintext_len={len(p)}, plaintext_preview={bytes(p)[:32].hex()}...")
+    logger.info(f"Sector {sector_id}: o_final={bytes(o).hex()}, sid={bytes(sid).hex()}")
+    logger.info(f"Sector {sector_id}: w_len={len(w)}, w_preview={w[:32].hex()}...")
+    logger.info(f"Sector {sector_id}: computed_mac={sum_bytes[:16].hex()}, expected_f={f.hex()}")
+    
+    if not hmac.compare_digest(sum_bytes[:16], f):
+        raise ValueError("sector auth compare fail")
+    
+    return bytes(p)
+
+
+def decrypt_file_contents(encrypted_data: bytes, file_key: FolderKey) -> bytes:
+    """Decrypt encrypted file data using sector-based decryption."""
+    offs = compute_cipher_offsets(len(encrypted_data))
+    
+    if offs.plain_size < 0 or offs.sectors < 0:
+        raise ValueError(f"invalid offsets for size={len(encrypted_data)}")
+    
+    out = bytearray()
+    sector = 0
+    
+    while sector < offs.sectors:
+        # Determine chunk covering up to TREE_SECTORS sectors
+        chunk_offset, chunk_end, chunk_length = cipher_download_offset(sector, offs)
+        
+        if chunk_offset < 0 or chunk_end > len(encrypted_data) or chunk_offset >= chunk_end:
+            raise ValueError(f"invalid chunk offsets at sector {sector}")
+        
+        # Level-0 auth position
+        a0_offset, a0_length, a0_authID = auth_sector_offset(sector, 0, offs)
+        
+        # Number of sectors available from this auth window
+        d = a0_length // AUTH_SIZE - a0_authID
+        if d <= 0:
+            raise ValueError(f"bad auth window d={d} at sector={sector}")
+        
+        # Data length for this chunk up to first level-0 auth
+        p = a0_offset - chunk_offset
+        
+        # Process up to d sectors in this chunk
+        for y in range(d):
+            if sector + y >= offs.sectors:
+                break
+            
+            # Compute sector length
+            f = SECTOR_SIZE
+            if not (a0_offset == SECTOR_SIZE * TREE_SECTORS or y != d - 1):
+                f = p - y * SECTOR_SIZE
+                if f < 0:
+                    raise ValueError(f"negative sector length at sector={sector + y}")
+            
+            data_start = chunk_offset + y * SECTOR_SIZE
+            data_end = data_start + f
+            
+            if data_start < 0 or data_end > len(encrypted_data):
+                raise ValueError(f"data slice OOB sector={sector + y}")
+            
+            c = encrypted_data[data_start:data_end]
+            
+            # Auth record for this sector at level 0
+            auth_start = a0_offset + (a0_authID + y) * AUTH_SIZE
+            auth_end = auth_start + AUTH_SIZE
+            
+            if auth_end > len(encrypted_data):
+                raise ValueError(f"auth slice OOB sector={sector + y}")
+            
+            h = encrypted_data[auth_start:auth_end]
+            
+            pt = decrypt_sector(file_key, c, h, sector + y)
+            out.extend(pt)
+        
+        sector += TREE_SECTORS
+    
+    # Truncate to exact plain size
+    if len(out) > offs.plain_size:
+        out = out[:offs.plain_size]
+    
+    return bytes(out)
