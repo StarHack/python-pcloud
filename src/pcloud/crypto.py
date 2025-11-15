@@ -278,7 +278,7 @@ def decrypt_private_key(
     priv_key = parse_private_key(encoded_private_key)
     pub_key = parse_public_key(encoded_public_key)
     
-    # Derive AES key and IV using PBKDF2
+    # Derive AES key and IV using PBKDF2.
     derived = PBKDF2(
         password.encode('utf-8'),
         priv_key.salt,
